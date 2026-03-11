@@ -17,5 +17,6 @@
     "types": [
       "bun-types" // add Bun global
     ]
-  }
+  },
+  "exclude": ["dist", "node_modules"]
 }

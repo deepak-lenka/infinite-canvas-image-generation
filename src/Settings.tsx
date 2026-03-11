@@ -1,23 +1,23 @@
 import { ChangeEventHandler, FC, useState } from "react";
 
-export const REPLICATE_TOKEN_KEY = "replicate-token";
+export const OPENAI_TOKEN_KEY = "openai-token";
 
 interface SettingsProps {
   close: () => void;
 }
 export const Settings: FC<SettingsProps> = ({ close }) => {
   const [dirty, setDirty] = useState(false);
-  const [replicateToken, setReplicateToken] = useState(
-    localStorage.getItem(REPLICATE_TOKEN_KEY) ?? ""
+  const [openaiToken, setOpenaiToken] = useState(
+    localStorage.getItem(OPENAI_TOKEN_KEY) ?? ""
   );
 
   const onChange: ChangeEventHandler<HTMLInputElement> = (e) => {
-    setReplicateToken(e.target.value);
+    setOpenaiToken(e.target.value);
     setDirty(true);
   };
   const onSubmit = () => {
     setDirty(false);
-    localStorage.setItem(REPLICATE_TOKEN_KEY, replicateToken);
+    localStorage.setItem(OPENAI_TOKEN_KEY, openaiToken);
   };
   return (
     <div
@@ -40,7 +40,7 @@ export const Settings: FC<SettingsProps> = ({ close }) => {
           </span>
         </div>
         <div className="text-xl">
-          Replicate token{" "}
+          OpenAI API Key{" "}
           <span className="text-sm">
             (if you are on the hosted version, no need to set)
           </span>
@@ -48,7 +48,7 @@ export const Settings: FC<SettingsProps> = ({ close }) => {
         <div className="flex h-10">
           <input
             type="password"
-            value={replicateToken}
+            value={openaiToken}
             onChange={onChange}
             className="flex-1 border border-gray-700 rounded mr-4 pl-2"
           />

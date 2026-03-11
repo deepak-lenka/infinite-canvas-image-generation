@@ -16,11 +16,13 @@ import { v4 } from "uuid";
 import { assertNever } from "./utils/assertNever";
 import { findEmptyArea } from "./utils/findEmptyArea";
 import { throttle } from "lodash-es";
-import { REPLICATE_TOKEN_KEY } from "./Settings";
-import { uploadFile } from "@uploadcare/upload-client";
+import { OPENAI_TOKEN_KEY } from "./Settings";
 import { getApi } from "./utils/getApi";
 
 const initialTransform = { x: 0, y: 0, scale: 1 };
+const IMAGE_SIZE = 400;
+const CHILD_IMAGE_DISTANCE_X = 460;
+const CHILD_IMAGE_DISTANCE_Y = 440;
 
 type ImageChild =
   | { type: "upscaled"; id: string; position?: number }
@@ -73,6 +75,7 @@ interface GeneratedImagesState {
   editorId: string | null;
   prevEditorId: string | null;
   activeImageId: string | null;
+  dirtyImageIds: Record<string, true>;
   workspaceTool: "select-tool" | "grab-tool" | "delete-tool";
   workspaceTransform: { x: number; y: number; scale: number };
   workspaceImages: Record<string, true>;
@@ -869,6 +872,7 @@ const initialState: GeneratedImagesState = {
   editorId: null,
   prevEditorId: null,
   activeImageId: null,
+  dirtyImageIds: {},
   workspaceTool: "select-tool",
   workspaceTransform: initialTransform,
   workspaceImages: {},
@@ -973,6 +977,16 @@ export const generatedImagesSlice = createSlice({
     },
     setActiveImage: (state, action: PayloadAction<{ id: string | null }>) => {
       state.activeImageId = action.payload.id;
+    },
+    setImageDirty: (
+      state,
+      action: PayloadAction<{ id: string; isDirty: boolean }>
+    ) => {
+      if (action.payload.isDirty) {
+        state.dirtyImageIds[action.payload.id] = true;
+        return;
+      }
+      delete state.dirtyImageIds[action.payload.id];
     },
     appendHistory: (state, action: PayloadAction<HistoryItem>) => {
       const isRefocus = (() => {
@@ -1151,46 +1165,170 @@ export const smoothTransformWorkspace = (transform: {
   };
 };
 
-export const uploadImage = async (blob: Blob): Promise<string> => {
-  const result = await uploadFile(blob, {
-    publicKey: "037a51a72cf85bf758c7",
-    store: true,
-    metadata: {},
-  });
+const getWorkspaceInsertTransform = (
+  workspaceTransform: { x: number; y: number; scale: number },
+  images: Record<string, GeneratedImage>
+) =>
+  findEmptyArea(
+    -workspaceTransform.x * (1 / workspaceTransform.scale),
+    -workspaceTransform.y * (1 / workspaceTransform.scale),
+    Object.values(images)
+  );
 
-  return result["cdnUrl"] as string;
+const isTransformOccupied = (
+  transform: { x: number; y: number },
+  images: Record<string, GeneratedImage>
+) =>
+  Object.values(images).some(
+    (image) =>
+      Math.abs(image.transform.x - transform.x) < IMAGE_SIZE &&
+      Math.abs(image.transform.y - transform.y) < IMAGE_SIZE
+  );
+
+const getNearbyChildTransform = (
+  parentImage: GeneratedImage,
+  images: Record<string, GeneratedImage>
+) => {
+  for (let column = 1; column <= 8; column++) {
+    const rowOffsets = [0];
+    for (let row = 1; row <= column; row++) {
+      rowOffsets.push(row, -row);
+    }
+    for (const rowOffset of rowOffsets) {
+      const candidate = {
+        x: parentImage.transform.x + column * CHILD_IMAGE_DISTANCE_X,
+        y: parentImage.transform.y + rowOffset * CHILD_IMAGE_DISTANCE_Y,
+      };
+      if (!isTransformOccupied(candidate, images)) {
+        return candidate;
+      }
+    }
+  }
+
+  return findEmptyArea(
+    parentImage.transform.x + CHILD_IMAGE_DISTANCE_X,
+    parentImage.transform.y,
+    Object.values(images)
+  );
+};
+
+const getWorkspaceImageFocusTransform = (
+  image: GeneratedImage,
+  scale: number
+) => ({
+  x: (-image.transform.x - 400 / 2) * scale,
+  y: (-image.transform.y - 400 / 2) * scale,
+  scale,
+});
+
+const createWorkspaceImageNode = ({
+  url,
+  prompt,
+  isCanvas,
+  workspaceTransform,
+  images,
+}: {
+  url: string;
+  prompt: string;
+  isCanvas: boolean;
+  workspaceTransform: { x: number; y: number; scale: number };
+  images: Record<string, GeneratedImage>;
+}): UpscaledGeneration => ({
+  id: v4(),
+  url: [url],
+  type: "upscaled",
+  percentageDone: 100,
+  isCanvas,
+  parent: null,
+  prompt,
+  children: [],
+  transform: getWorkspaceInsertTransform(workspaceTransform, images),
+});
+
+const createBlankCanvasBlob = async (): Promise<Blob> => {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1024;
+  canvas.height = 1024;
+  const context = canvas.getContext("2d");
+  if (context == null) {
+    throw new Error("Could not create blank canvas.");
+  }
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  const blob = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, "image/png");
+  });
+  if (blob == null) {
+    throw new Error("Could not create blank canvas.");
+  }
+  return blob;
+};
+
+export const uploadImage = async (blob: Blob): Promise<string> => {
+  const b64 = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      resolve(dataUrl.split(",")[1] ?? "");
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+  const response = await fetch(`${getApi()}/upload`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ imageData: b64, mimeType: blob.type || "image/png" }),
+  });
+  if (!response.ok) {
+    throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
+  }
+  const result = await response.json();
+  return result["url"] as string;
+};
+
+export const importImageFromFile = (
+  file: File,
+  opts?: { navigate?: boolean }
+): AppThunk => {
+  return async (dispatch, getState) => {
+    if (!file.type.startsWith("image/")) {
+      throw new Error("Please select a valid image file.");
+    }
+
+    const uploadedUrl = await uploadImage(file);
+    const state = getState().generatedImages;
+    const image = createWorkspaceImageNode({
+      url: uploadedUrl,
+      prompt: file.name,
+      isCanvas: false,
+      workspaceTransform: state.workspaceTransform,
+      images: state.images,
+    });
+
+    dispatch(generatedImagesSlice.actions.addImage(image));
+
+    if (opts?.navigate) {
+      const newScale = Math.max(1.1, state.workspaceTransform.scale);
+      dispatch(
+        smoothTransformWorkspace(getWorkspaceImageFocusTransform(image, newScale))
+      );
+    }
+  };
 };
 
 export const addWhiteImage = (): AppThunk => {
   return async (dispatch, getState) => {
-    const state = getState();
-    const workspaceTransform = state.generatedImages.workspaceTransform;
-    const images = state.generatedImages.images;
-
-    const image: GeneratedImage = {
-      id: v4(),
-      url: ["https://ucarecdn.com/1b9e1cef-ed30-450d-a88f-ded57eb6ec35/"],
-      type: "upscaled",
-      percentageDone: 100,
-      prompt: "white background",
+    const uploadedUrl = await uploadImage(await createBlankCanvasBlob());
+    const state = getState().generatedImages;
+    const image = createWorkspaceImageNode({
+      url: uploadedUrl,
+      prompt: "empty canvas",
       isCanvas: true,
-      parent: null,
-      children: [],
-      transform: findEmptyArea(
-        -workspaceTransform.x * (1 / workspaceTransform.scale),
-        -workspaceTransform.y * (1 / workspaceTransform.scale),
-        Object.values(images)
-      ),
-    };
+      workspaceTransform: state.workspaceTransform,
+      images: state.images,
+    });
     dispatch(generatedImagesSlice.actions.addImage(image));
-    const newScale = Math.max(1.2, workspaceTransform.scale);
-    dispatch(
-      smoothTransformWorkspace({
-        x: (-image.transform.x - 400 / 2) * newScale,
-        y: (-image.transform.y - 400 / 2) * newScale,
-        scale: newScale,
-      })
-    );
+    dispatch(setEditingImage(image.id));
   };
 };
 
@@ -1216,8 +1354,8 @@ export const generateImageVariations = (
       parent: null,
       children: [],
       transform: findEmptyArea(
-        -workspaceTransform.x,
-        -workspaceTransform.y,
+        -workspaceTransform.x * (1 / workspaceTransform.scale),
+        -workspaceTransform.y * (1 / workspaceTransform.scale),
         Object.values(getState().generatedImages.images)
       ),
     };
@@ -1244,7 +1382,7 @@ export const generateImageVariations = (
         },
         body: JSON.stringify({
           prompt,
-          replicateToken: localStorage.getItem(REPLICATE_TOKEN_KEY),
+          openaiToken: localStorage.getItem(OPENAI_TOKEN_KEY),
         }),
       });
       if (response.status < 200 || response.status >= 300) {
@@ -1328,7 +1466,7 @@ export const generateImageToImageVariations = (
           body: JSON.stringify({
             prompt,
             url: originalImage.url![position],
-            replicateToken: localStorage.getItem(REPLICATE_TOKEN_KEY),
+            openaiToken: localStorage.getItem(OPENAI_TOKEN_KEY),
           }),
         });
         if (response.status < 200 || response.status >= 300) {
@@ -1351,7 +1489,7 @@ export const generateImageToImageVariations = (
         body: JSON.stringify({
           prompt,
           url: originalImage.url![position],
-          replicateToken: localStorage.getItem(REPLICATE_TOKEN_KEY),
+          openaiToken: localStorage.getItem(OPENAI_TOKEN_KEY),
         }),
       });
       if (response.status < 200 || response.status >= 300) {
@@ -1379,7 +1517,8 @@ export const generateImageToImageVariations = (
 
 export const upscaleImage = (imageId: string, position: number): AppThunk => {
   return async (dispatch, getState) => {
-    const originalImage = getState().generatedImages.images[imageId];
+    const state = getState().generatedImages;
+    const originalImage = state.images[imageId];
     if (originalImage == null || originalImage.url == null) {
       console.error("Could not find image", imageId);
       return;
@@ -1394,12 +1533,7 @@ export const upscaleImage = (imageId: string, position: number): AppThunk => {
       parent: { id: imageId, position },
       prompt: originalImage.prompt,
       children: [],
-      transform: {
-        x:
-          originalImage.transform.x +
-          Math.floor((Math.random() - 0.5) * 200 + 900),
-        y: originalImage.transform.y + Math.floor((Math.random() - 0.5) * 500),
-      },
+      transform: getNearbyChildTransform(originalImage, state.images),
     };
     dispatch(
       batchActions([
@@ -1420,7 +1554,6 @@ export const upscaleImage = (imageId: string, position: number): AppThunk => {
         },
         body: JSON.stringify({
           url: originalImage.url[position],
-          replicateToken: localStorage.getItem(REPLICATE_TOKEN_KEY),
         }),
       });
       if (response.status < 200 || response.status >= 300) {
@@ -1454,10 +1587,8 @@ export const addImageToWorkspace = (
   position: number
 ): AppThunk => {
   return (dispatch, getState) => {
-    const state = getState();
-    const originalImage = state.generatedImages.images[imageId];
-    const workspaceTransform = state.generatedImages.workspaceTransform;
-    const images = state.generatedImages.images;
+    const state = getState().generatedImages;
+    const originalImage = state.images[imageId];
     if (originalImage == null || originalImage.url == null) {
       console.error("Could not find image", imageId);
       return;
@@ -1472,11 +1603,7 @@ export const addImageToWorkspace = (
       parent: { id: imageId, position },
       prompt: originalImage.prompt,
       children: [],
-      transform: findEmptyArea(
-        -workspaceTransform.x * (1 / workspaceTransform.scale),
-        -workspaceTransform.y * (1 / workspaceTransform.scale),
-        Object.values(images)
-      ),
+      transform: getNearbyChildTransform(originalImage, state.images),
     };
     dispatch(
       batchActions([
@@ -1509,6 +1636,12 @@ export const selectUpscaledImageChildren = createSelector(
     }
     return loadingImages;
   }
+);
+
+export const selectIsImageDirty = createSelector(
+  (state: RootState) => state.generatedImages.dirtyImageIds,
+  (_: RootState, imageId: string) => imageId,
+  (dirtyImageIds, imageId) => imageId in dirtyImageIds
 );
 
 export const onWorkspaceElement = (workspaceEl: HTMLElement): AppThunk => {

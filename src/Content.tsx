@@ -14,6 +14,7 @@ import {
   localWorkspaceTransform,
   navigateHistory,
   onWorkspaceElement,
+  selectIsImageDirty,
   setEditingImage,
   smoothTransformWorkspace,
   transformWorkspace,
@@ -62,6 +63,9 @@ export const Content: FC = () => {
   const dispatch = useAppDispatch();
   const images = useAppSelector((state) => state.generatedImages.images);
   const editorId = useAppSelector((state) => state.generatedImages.editorId);
+  const isEditorDirty = useAppSelector((state) =>
+    editorId == null ? false : selectIsImageDirty(state, editorId)
+  );
   const workspaceImages = useAppSelector(
     (state) => state.generatedImages.workspaceImages
   );
@@ -99,10 +103,7 @@ export const Content: FC = () => {
       const delta = normalizeWheel(e);
       const isMoving =
         delta.x !== 0 && (Math.abs(delta.x) > 2 || Math.abs(delta.y) > 2);
-      if (
-        editorId != null &&
-        (isMoving || localWorkspaceTransform.scale < 0.9)
-      ) {
+      if (editorId != null && isMoving && !isEditorDirty) {
         dispatch(setEditingImage(null));
       }
 
@@ -156,10 +157,13 @@ export const Content: FC = () => {
     return () => {
       target.removeEventListener("wheel", handleWheel);
     };
-  }, [dispatch, editorId]);
+  }, [dispatch, editorId, isEditorDirty]);
 
   const onMouseDown: MouseEventHandler = (e) => {
     if (e.target !== e.currentTarget) return;
+    if (editorId != null && isEditorDirty) {
+      return;
+    }
     setDragging(true);
     dispatch(setEditingImage(null));
     dispatch(

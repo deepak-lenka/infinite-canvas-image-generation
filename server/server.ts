@@ -1,13 +1,15 @@
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
-import Replicate from "replicate";
+import OpenAI, { toFile } from "openai";
 import dotenv from "dotenv";
-import { uploadFile } from "@uploadcare/upload-client";
 import fetch, { Headers } from "node-fetch";
 import path from "path";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
+import crypto from "crypto";
+import type { Request, Response, NextFunction } from "express";
 
 if (!globalThis.fetch) {
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
@@ -24,288 +26,384 @@ const __dirname = dirname(__filename);
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", true);
+
+const LOG_PREFIX = "[image-server]";
+const maskSecret = (value: string | null | undefined) => {
+  if (!value) {
+    return "missing";
+  }
+  if (value.length <= 8) {
+    return "***";
+  }
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+};
+
+const serializeError = (error: unknown) => {
+  if (error instanceof Error) {
+    const errorWithExtras = error as Error & {
+      status?: number;
+      code?: string;
+      type?: string;
+      cause?: unknown;
+    };
+    return {
+      name: error.name,
+      message: error.message,
+      status: errorWithExtras.status ?? null,
+      code: errorWithExtras.code ?? null,
+      type: errorWithExtras.type ?? null,
+      cause:
+        typeof errorWithExtras.cause === "string"
+          ? errorWithExtras.cause
+          : undefined,
+      stack: error.stack,
+    };
+  }
+  return {
+    message: String(error),
+  };
+};
+
+const logInfo = (event: string, details?: Record<string, unknown>) => {
+  console.log(`${LOG_PREFIX} ${event}`, details ?? {});
+};
+
+const logError = (event: string, error: unknown, details?: Record<string, unknown>) => {
+  console.error(`${LOG_PREFIX} ${event}`, {
+    ...(details ?? {}),
+    error: serializeError(error),
+  });
+};
+
+const getRequestId = (req: Request) => req.header("x-request-id") ?? crypto.randomUUID();
+const trimPromptForLog = (prompt: unknown) => String(prompt ?? "").trim().slice(0, 120);
+const hasServerOpenAIKey = String(process.env.OPENAI_API_KEY ?? "").trim().length > 0;
 
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: "50mb" }));
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const requestId = getRequestId(req);
+  res.locals.requestId = requestId;
+  const startedAt = Date.now();
+  logInfo("request.start", {
+    requestId,
+    method: req.method,
+    path: req.path,
+    contentLength: req.header("content-length") ?? null,
+  });
+  res.on("finish", () => {
+    logInfo("request.finish", {
+      requestId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startedAt,
+    });
+  });
+  next();
+});
+
+const UPLOADS_DIR = path.resolve(
+  process.env.UPLOADS_DIR || path.join(__dirname, "uploads")
+);
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+app.use("/images", express.static(UPLOADS_DIR));
+
+const getOpenAIClient = (tokenFromRequest: unknown): OpenAI | null => {
+  const token = String(
+    (process.env.OPENAI_API_KEY ?? tokenFromRequest ?? "")
+  ).trim();
+  if (!token || token.length < 10) {
+    return null;
+  }
+  return new OpenAI({ apiKey: token });
+};
+
+const getBaseUrl = (req: express.Request): string => {
+  const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL ?? "")
+    .trim()
+    .replace(/\/$/, "");
+  if (configuredBaseUrl.length > 0) {
+    return configuredBaseUrl;
+  }
+  return `${req.protocol}://${req.get("host")}`;
+};
+
+const saveBase64AsImage = (b64: string): string => {
+  const filename = `${crypto.randomUUID()}.png`;
+  fs.writeFileSync(path.join(UPLOADS_DIR, filename), b64, "base64");
+  logInfo("image.saved", {
+    filename,
+    bytesApprox: Math.round((b64.length * 3) / 4),
+  });
+  return filename;
+};
+
+// Fetch a remote URL and return its buffer + content-type.
+// For URLs served by our own /images route, read from disk directly.
+const urlToBuffer = async (
+  url: string
+): Promise<{ buffer: Buffer; contentType: string }> => {
+  const localMatch = url.match(/\/images\/([^/?#]+)$/);
+  if (localMatch) {
+    const filepath = path.join(UPLOADS_DIR, localMatch[1]);
+    if (fs.existsSync(filepath)) {
+      logInfo("image.load.local", {
+        filename: localMatch[1],
+      });
+      return { buffer: fs.readFileSync(filepath), contentType: "image/png" };
+    }
+  }
+  logInfo("image.fetch.remote.start", { url });
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch image ${url}: ${response.status} ${response.statusText}`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const contentType = response.headers.get("content-type") || "image/png";
+  logInfo("image.fetch.remote.success", {
+    url,
+    contentType,
+    bytes: buffer.length,
+  });
+  return { buffer, contentType };
+};
 
 app.post("/imagine-variations", async (req, res) => {
-  const { prompt, replicateToken } = req.body;
+  const { prompt, openaiToken } = req.body;
+  const requestId = res.locals.requestId as string;
+
+  const openai = getOpenAIClient(openaiToken);
+  if (!openai) {
+    logInfo("imagine.auth.invalid", {
+      requestId,
+      usingServerKey: hasServerOpenAIKey,
+      requestKeyPreview: maskSecret(String(openaiToken ?? "").trim()),
+    });
+    res.status(400).json({
+      error:
+        "Missing or invalid OpenAI API key. Set OPENAI_API_KEY on the server or provide it via the Settings UI.",
+    });
+    return;
+  }
 
   try {
-    console.log("start imagine", prompt);
-    const replicate = new Replicate({
-      auth: process.env.REPLICATE_API_TOKEN ?? replicateToken,
+    logInfo("imagine.start", {
+      requestId,
+      promptPreview: trimPromptForLog(prompt),
+      usingServerKey: hasServerOpenAIKey,
     });
-    const output = (await replicate.run(
-      // "stability-ai/stable-diffusion:ac732df83cea7fff18b8472768c88ad041fa750ff7682a21affe81863cbe77e4",
-      "stability-ai/sdxl:d830ba5dabf8090ec0db6c10fc862c6eb1c929e1a194a5411852d25fd954ac82",
-      {
-        input: {
-          prompt,
-          num_outputs: 4,
-          num_inference_steps: 50,
-          scheduler: "DDIM",
-          guidance_scale: 7.5,
-          prompt_strength: 0.8,
-          refine: "expert_ensemble_refiner",
-          high_noise_fraction: 0.8,
-          lora_scale: 0.6,
-          height: 1024,
-          width: 1024,
-          seed: 1,
-        },
-      }
-    )) as unknown as string[];
-    const urls = await uploadImages(output);
-    console.log("done imagining", urls);
+    const result = await openai.images.generate({
+      model: "gpt-image-1.5",
+      prompt,
+      n: 4,
+      size: "1024x1024",
+      quality: "medium",
+    });
+
+    const baseUrl = getBaseUrl(req);
+    const urls = (result.data ?? [])
+      .filter((item) => item.b64_json != null)
+      .map((item) => {
+        const filename = saveBase64AsImage(item.b64_json!);
+        return `${baseUrl}/images/${filename}`;
+      });
+    logInfo("imagine.success", {
+      requestId,
+      outputCount: urls.length,
+    });
     res.json({ variations: urls });
   } catch (error: any) {
-    console.error(error);
-    res.status(500).json({ error });
+    logError("imagine.error", error, {
+      requestId,
+      promptPreview: trimPromptForLog(prompt),
+    });
+    res.status(500).json({ error: error.message ?? String(error) });
   }
 });
 
 app.post("/image-to-image-variations", async (req, res) => {
-  const { prompt, url, replicateToken } = req.body;
+  const { prompt, url, openaiToken } = req.body;
+  const requestId = res.locals.requestId as string;
 
-  try {
-    console.log("before img to img", { prompt, url });
-
-    const replicate = new Replicate({
-      auth: process.env.REPLICATE_API_TOKEN ?? replicateToken,
+  const openai = getOpenAIClient(openaiToken);
+  if (!openai) {
+    logInfo("image_to_image.auth.invalid", {
+      requestId,
+      usingServerKey: hasServerOpenAIKey,
+      requestKeyPreview: maskSecret(String(openaiToken ?? "").trim()),
     });
-    const output = (await replicate.run(
-      "stability-ai/stable-diffusion-img2img:15a3689ee13b0d2616e98820eca31d4c3abcd36672df6afce5cb6feb1d66087d",
-      {
-        input: {
-          prompt,
-          image: url,
-          width: 1024,
-          height: 1024,
-          num_outputs: 1,
-          guidance_scale: 7.5,
-          prompt_strength: 0.92,
-          num_inference_steps: 50,
-        },
-      }
-    )) as unknown as string[];
-    console.log("got image to image results", output);
-    const urls = await uploadImages(output);
-    res.json({ variations: urls });
-  } catch (error: any) {
-    console.error(error);
-    res.status(500).json({ error });
-  }
-});
-
-app.post("/upscale", async (req, res) => {
-  const { url, replicateToken } = req.body;
-
-  try {
-    console.log("before upscale", url);
-
-    const replicate = new Replicate({
-      auth: process.env.REPLICATE_API_TOKEN ?? replicateToken,
+    res.status(400).json({
+      error:
+        "Missing or invalid OpenAI API key. Set OPENAI_API_KEY on the server or provide it via the Settings UI.",
     });
-    const output = (await replicate.run(
-      "nightmareai/real-esrgan:42fed1c4974146d4d2414e2be2c5277c7fcf05fcc3a73abf41610695738c1d7b",
-      {
-        input: {
-          image: url,
-          scale: 2,
-        },
-      }
-    )) as unknown as string;
-    const urls = await uploadImages([output]);
-    console.log("got upscale results", urls);
-    res.json({ upscaled: urls[0] });
-  } catch (error: any) {
-    console.error(error);
-    res.status(500).json({ error });
-  }
-});
-
-// async function fetchImageAndConvertToBase64(url: string) {
-//   const response = await fetch(url);
-//   const buffer = await response.buffer();
-
-//   // Convert the Buffer to a Base64 string
-//   const base64 = buffer.toString("base64");
-
-//   return `data:image/png;base64,${base64}`;
-// }
-
-// app.post("/sketch-to-image-variations", async (req, res) => {
-//   const { url, prompt } = req.body;
-
-//   try {
-//     console.log("before sketch", url);
-//     // const response = await fetch("https://wallpapercave.com/wp/wp4471392.jpg");
-//     // const file = await response.blob();
-//     const blob = await createFileFromURL(url);
-//     const form = new FormData();
-//     form.append("sketch_file", blob);
-//     form.append("prompt", prompt);
-
-//     const respone = await fetch(
-//       "https://clipdrop-api.co/sketch-to-image/v1/sketch-to-image",
-//       {
-//         method: "POST",
-//         headers: {
-//           // "Content-Type": "multipart/form-data",
-//           "x-api-key":
-//             "c5a023af5d25f52b2349d586ba5c770630819e7d34bc5f893414dd56790088df74b2fa58249728bb2010448dade2cccd",
-//         },
-//         body: form,
-//       }
-//     );
-
-//     const a = await respone.json();
-//     console.log("SKETCH", respone, a);
-
-//     // const urls = await uploadImages([output]);
-//     // console.log("got upscale results", urls);
-//     res.json({ variations: "yeah" });
-//   } catch (error: any) {
-//     console.error(error);
-//     res.status(500).json({ error });
-//   }
-// });
-
-// app.post("/sketch-to-image-variations", async (req, res) => {
-//   const { url, prompt } = req.body;
-//   console.log("sketch", url, prompt);
-//   try {
-//     const remixId = await startSketch(url, prompt);
-//     console.log("REMOIX ID", remixId);
-//     res.json({ variations: "yeah" });
-//   } catch (error: any) {
-//     console.error(error);
-//     res.status(500).json({ error });
-//   }
-// });
-
-app.post("/sketch-to-image-variations", async (req, res) => {
-  const { url, prompt, replicateToken } = req.body;
-  console.log("sketch", url, prompt);
-  try {
-    const replicate = new Replicate({
-      auth: process.env.REPLICATE_API_TOKEN ?? replicateToken,
-    });
-    const output = (await replicate.run(
-      "jagilley/controlnet-scribble:435061a1b5a4c1e26740464bf786efdfa9cb3a3ac488595a2de23e143fdb0117",
-      {
-        input: {
-          prompt,
-          image: url,
-          image_resolution: "768",
-          num_outputs: 1,
-        },
-      }
-    )) as unknown as string[];
-    console.log("my output.", output);
-    const urls = await uploadImages(output.slice(1));
-    res.json({ variations: urls });
-  } catch (error: any) {
-    console.error(error);
-    res.status(500).json({ error });
-  }
-});
-
-async function createFormData(image: Blob, prompt: string) {
-  const formData = new FormData();
-  formData.append("files", image);
-  formData.append("prompt", prompt || "A hand-drawn sketch");
-  formData.append("mode", "scribble");
-  formData.append("numberOfImages", "4");
-
-  return formData;
-}
-
-async function postImageToApi(formData: FormData) {
-  const modelId = "1e7737d7-545e-469f-857f-e4b46eaa151d";
-  const apiUrl = `https://api.tryleap.ai/api/v1/images/models/${modelId}/remix`;
-
-  const response = await fetch(apiUrl, {
-    method: "POST",
-    body: formData,
-    headers: {
-      Authorization: `Bearer 5e94d609-50f1-440f-98b7-9df0fd3eda8e`,
-    },
-  });
-  //
-  if (!response.ok) {
-    console.log(await response.json());
-    throw new Error(`API request failed with status ${response.status}`);
-  }
-
-  const jsonResponse = (await response.json()) as any;
-  const remixId = jsonResponse["id"];
-
-  if (!remixId) {
-    throw new Error("Remix ID not found in API response");
-  }
-
-  return remixId;
-}
-
-async function createFileFromURL(url: string) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${url}`);
-  }
-
-  const data = await response.arrayBuffer();
-  const contentType =
-    response.headers.get("content-type") || "binary/octet-stream";
-
-  const blob = new Blob([data], { type: contentType });
-  const fileName = url.split("/").pop() || "file";
-
-  // Create a File object from the Blob
-  const file = new File([blob], fileName, { type: contentType });
-
-  return file;
-}
-
-const startSketch = async (url: string, prompt: string) => {
-  const blob = await createFileFromURL(url);
-  let remixId;
-  try {
-    const formData = await createFormData(blob, prompt);
-    remixId = await postImageToApi(formData);
-  } catch (error: unknown) {
-    console.error(error);
-    console.error("Error while making request to external API:");
     return;
   }
 
-  return remixId;
-};
+  try {
+    logInfo("image_to_image.start", {
+      requestId,
+      promptPreview: trimPromptForLog(prompt),
+      sourceUrl: url,
+    });
+    const { buffer, contentType } = await urlToBuffer(url);
+    const imageFile = await toFile(buffer, "input.png", { type: contentType });
 
-const uploadImages = async (urls: string[]) => {
-  const t = performance.now();
+    const result = await openai.images.edit({
+      model: "gpt-image-1.5",
+      image: imageFile,
+      prompt,
+      n: 1,
+      size: "1024x1024",
+    });
 
-  const results = await Promise.all(
-    urls.map((url) => {
-      return uploadFile(url, {
-        publicKey: "037a51a72cf85bf758c7",
-        store: true,
-        metadata: {},
+    const baseUrl = getBaseUrl(req);
+    const urls = (result.data ?? [])
+      .filter((item) => item.b64_json != null)
+      .map((item) => {
+        const filename = saveBase64AsImage(item.b64_json!);
+        return `${baseUrl}/images/${filename}`;
       });
-    })
-  );
-  console.log("ms to upload images:", performance.now() - t);
-
-  return results.map((r) => r["cdnUrl"]);
-};
-
-app.use(express.static(path.join(__dirname, "../dist")));
-app.get("*", (req, res) => {
-  res.sendFile(path.resolve(__dirname, "../dist", "index.html"));
+    logInfo("image_to_image.success", {
+      requestId,
+      outputCount: urls.length,
+    });
+    res.json({ variations: urls });
+  } catch (error: any) {
+    logError("image_to_image.error", error, {
+      requestId,
+      promptPreview: trimPromptForLog(prompt),
+      sourceUrl: url,
+    });
+    res.status(500).json({ error: error.message ?? String(error) });
+  }
 });
+
+// OpenAI has no direct upscaler; pass the original URL through so the UX
+// (adding the image as a separate canvas node) still works as expected.
+app.post("/upscale", async (req, res) => {
+  const { url } = req.body;
+  const requestId = res.locals.requestId as string;
+  logInfo("upscale.passthrough", {
+    requestId,
+    sourceUrl: url,
+  });
+  res.json({ upscaled: url });
+});
+
+app.post("/sketch-to-image-variations", async (req, res) => {
+  const { url, prompt, openaiToken } = req.body;
+  const requestId = res.locals.requestId as string;
+
+  const openai = getOpenAIClient(openaiToken);
+  if (!openai) {
+    logInfo("sketch_to_image.auth.invalid", {
+      requestId,
+      usingServerKey: hasServerOpenAIKey,
+      requestKeyPreview: maskSecret(String(openaiToken ?? "").trim()),
+    });
+    res.status(400).json({
+      error:
+        "Missing or invalid OpenAI API key. Set OPENAI_API_KEY on the server or provide it via the Settings UI.",
+    });
+    return;
+  }
+
+  try {
+    logInfo("sketch_to_image.start", {
+      requestId,
+      promptPreview: trimPromptForLog(prompt),
+      sourceUrl: url,
+    });
+    const { buffer, contentType } = await urlToBuffer(url);
+    const imageFile = await toFile(buffer, "sketch.png", { type: contentType });
+
+    const result = await openai.images.edit({
+      model: "gpt-image-1.5",
+      image: imageFile,
+      prompt: `Transform this sketch into a detailed, high-quality image: ${prompt}`,
+      n: 1,
+      size: "1024x1024",
+    });
+
+    const baseUrl = getBaseUrl(req);
+    const urls = (result.data ?? [])
+      .filter((item) => item.b64_json != null)
+      .map((item) => {
+        const filename = saveBase64AsImage(item.b64_json!);
+        return `${baseUrl}/images/${filename}`;
+      });
+    logInfo("sketch_to_image.success", {
+      requestId,
+      outputCount: urls.length,
+    });
+    res.json({ variations: urls });
+  } catch (error: any) {
+    logError("sketch_to_image.error", error, {
+      requestId,
+      promptPreview: trimPromptForLog(prompt),
+      sourceUrl: url,
+    });
+    res.status(500).json({ error: error.message ?? String(error) });
+  }
+});
+
+// Upload a base64-encoded image (from canvas saves) and return a hosted URL.
+app.post("/upload", async (req, res) => {
+  const { imageData, mimeType = "image/png" } = req.body;
+  const requestId = res.locals.requestId as string;
+  if (!imageData) {
+    logInfo("upload.invalid", {
+      requestId,
+      reason: "missing imageData",
+    });
+    res.status(400).json({ error: "Missing imageData field" });
+    return;
+  }
+  try {
+    const ext = String(mimeType).split("/")[1]?.split("+")[0] || "png";
+    const filename = `${crypto.randomUUID()}.${ext}`;
+    fs.writeFileSync(
+      path.join(UPLOADS_DIR, filename),
+      String(imageData),
+      "base64"
+    );
+    const baseUrl = getBaseUrl(req);
+    logInfo("upload.success", {
+      requestId,
+      filename,
+      mimeType,
+    });
+    res.json({ url: `${baseUrl}/images/${filename}` });
+  } catch (error: any) {
+    logError("upload.error", error, {
+      requestId,
+      mimeType,
+    });
+    res.status(500).json({ error: error.message ?? String(error) });
+  }
+});
+
+const clientDistDir = path.resolve(__dirname, "../../dist");
+const clientIndexHtmlPath = path.join(clientDistDir, "index.html");
+if (fs.existsSync(clientIndexHtmlPath)) {
+  app.use(express.static(clientDistDir));
+  app.get("*", (_req, res) => {
+    res.sendFile(clientIndexHtmlPath);
+  });
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
+  logInfo("startup", {
+    port: PORT,
+    serverOpenAIKey: maskSecret(String(process.env.OPENAI_API_KEY ?? "").trim()),
+    uploadsDir: UPLOADS_DIR,
+    clientDistExists: fs.existsSync(clientIndexHtmlPath),
+    runningOnVercel: Boolean(process.env.VERCEL),
+  });
   console.log(`Server is running on http://localhost:${PORT}`);
 });

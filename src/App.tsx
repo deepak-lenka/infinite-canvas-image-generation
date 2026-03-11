@@ -1,9 +1,10 @@
 import clsx from "clsx";
-import { FC, KeyboardEventHandler, useEffect, useState } from "react";
+import { FC, KeyboardEventHandler, useEffect, useRef, useState } from "react";
 import {
   addWhiteImage,
   generateImageVariations,
   generatedImagesSlice,
+  importImageFromFile,
   useAppDispatch,
   useAppSelector,
 } from "./state";
@@ -79,6 +80,7 @@ function App() {
   const editorId = useAppSelector((state) => state.generatedImages.editorId);
   const transRef = useSpringRef();
   const [showSettings, setShowSettings] = useState(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const workspaceTool = useAppSelector(
     (state) => state.generatedImages.workspaceTool
   );
@@ -104,6 +106,18 @@ function App() {
   const onGenerate = (prompt: string) => {
     dispatch(generateImageVariations(prompt, { navigate: true }));
   };
+  const onImportImage = async (file: File | null) => {
+    if (file == null) {
+      return;
+    }
+    try {
+      await dispatch(importImageFromFile(file, { navigate: true }));
+    } catch (error) {
+      window.alert(
+        error instanceof Error ? error.message : "Could not import image"
+      );
+    }
+  };
   return (
     <div className="flex-1 relative flex">
       {showSettings && (
@@ -113,6 +127,17 @@ function App() {
           }}
         />
       )}
+      <input
+        ref={importInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0] ?? null;
+          void onImportImage(file);
+          e.target.value = "";
+        }}
+      />
       <Content />
       {transitionInput(
         (style, item) =>
@@ -219,7 +244,7 @@ function App() {
                     "flex justify-center items-center rounded select-none aspect-square cursor-pointer hover:bg-gray-100 active:bg-gray-200"
                   )}
                   onClick={() => {
-                    window.alert("Not implemented yet!");
+                    importInputRef.current?.click();
                   }}
                 >
                   <span className="material-symbols-outlined text-[22px]">
@@ -229,7 +254,7 @@ function App() {
                 <Tip
                   id="#add-image"
                   place="right-start"
-                  content="Not implemented hehe"
+                  content="Add image"
                 />
 
                 <div

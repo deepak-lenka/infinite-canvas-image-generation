@@ -12,6 +12,7 @@ import {
   generatedImagesSlice,
   generateImageToImageVariations,
   addImageToWorkspace,
+  selectIsImageDirty,
 } from "./state";
 import { assertNever } from "./utils/assertNever";
 import { useTransition } from "@react-spring/web";
@@ -38,12 +39,12 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
   const drawTransRef = useSpringRef();
 
   const [editor, setEditor] = useState<ImageEditor | null>(null);
-  const [isDirty, setIsDirty] = useState(false);
   const [tool, setTool] = useState<"generate-variations" | "draw" | null>(null);
   const editorRef = useRef<HTMLDivElement | null>(null);
   const imageChildren = useAppSelector((state) =>
     selectUpscaledImageChildren(state, image.id)
   );
+  const isDirty = useAppSelector((state) => selectIsImageDirty(state, image.id));
   const [activePosition, setActivePosition] = useState<number | null>(null);
 
   useEffect(() => {
@@ -119,7 +120,6 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
       // TODO: remove settimeout, currently used so components can clean up reliably
       setTimeout(() => editor.destroy(), 100);
       setEditor(null);
-      setIsDirty(false);
     }
     if (!isEditing) {
       setActivePosition(null);
@@ -151,12 +151,17 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
         .upperCanvasEl as HTMLCanvasElement;
       canvasElement.addEventListener("mouseup", () => {
         if (instance.getDrawingMode() !== "FREE_DRAWING") return;
-        setIsDirty(true);
+        dispatch(
+          generatedImagesSlice.actions.setImageDirty({
+            id: image.id,
+            isDirty: true,
+          })
+        );
       });
     });
 
     setEditor(instance);
-  }, [editor, image.type, image.url, isEditing]);
+  }, [dispatch, editor, image.id, image.type, image.url, isEditing]);
 
   const initialText = useMemo(() => {
     if (image.prompt === "white background") {
@@ -214,6 +219,11 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
                   placeholder="Generate variation..."
                   onSubmit={onGenerate}
                 />
+                {image.type === "upscaled" && image.isCanvas && (
+                  <div className="mt-1 canvas-item bg-white rounded text-[10px] px-2 py-1 text-gray-700">
+                    Use black strokes on a white canvas for best sketch generations.
+                  </div>
+                )}
               </div>
             </animated.div>
           )
@@ -227,7 +237,6 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
                 <DrawingTools
                   editor={editor}
                   isDirty={isDirty}
-                  setIsDirty={setIsDirty}
                   image={image}
                 />
               </div>
@@ -258,7 +267,6 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
                   editor={editor}
                   isDirty={isDirty}
                   tool={tool}
-                  setIsDirty={setIsDirty}
                   setTool={setTool}
                 />
               </animated.div>
@@ -519,7 +527,6 @@ interface EditorProps {
   editor: ImageEditor | null;
   isDirty: boolean;
   tool: "generate-variations" | "draw" | null;
-  setIsDirty: (isDirty: boolean) => void;
   setTool: (tool: "generate-variations" | "draw" | null) => void;
 }
 const Editor: FC<EditorProps> = ({
@@ -529,7 +536,6 @@ const Editor: FC<EditorProps> = ({
   editor,
   isDirty,
   tool,
-  setIsDirty,
   setTool,
 }) => {
   const dispatch = useAppDispatch();
@@ -561,11 +567,6 @@ const Editor: FC<EditorProps> = ({
               if (isDirty) {
                 window.alert("Save or discard paint changes first!");
                 return;
-              }
-              if (image.type === "upscaled" && image.isCanvas) {
-                window.alert(
-                  "Only use black and white colors when generating an image based of a doodle!s"
-                );
               }
               setTool(
                 tool === "generate-variations" ? null : "generate-variations"
@@ -741,14 +742,8 @@ interface DrawingToolsProps {
   editor: ImageEditor;
   isDirty: boolean;
   image: GeneratedImage;
-  setIsDirty: (dirty: boolean) => void;
 }
-const DrawingTools: FC<DrawingToolsProps> = ({
-  editor,
-  image,
-  isDirty,
-  setIsDirty,
-}) => {
+const DrawingTools: FC<DrawingToolsProps> = ({ editor, image, isDirty }) => {
   const dispatch = useAppDispatch();
   const [tool, setTool] = useState<"draw" | "crop" | "eraser" | null>("draw");
   const [penColor, setPenColor] = useState("rgb(0,0,0)");
@@ -787,13 +782,19 @@ const DrawingTools: FC<DrawingToolsProps> = ({
     setIsUndoEmpty(editor.isEmptyUndoStack());
     setIsRedoEmpty(editor.isEmptyRedoStack());
 
-    if (tool == null || tool !== "draw") {
+    if (tool == null || (tool !== "draw" && tool !== "eraser")) {
       editor.stopDrawingMode();
     }
     if (tool === "draw") {
       editor.startDrawingMode("FREE_DRAWING", {
         width: penWdith === 1 ? 3 : penWdith ** 3,
         color: penColor,
+      });
+    }
+    if (tool === "eraser") {
+      editor.startDrawingMode("FREE_DRAWING", {
+        width: Math.max(12, penWdith ** 4),
+        color: "rgba(255,255,255,1)",
       });
     }
     return () => {
@@ -828,8 +829,12 @@ const DrawingTools: FC<DrawingToolsProps> = ({
           tool === "eraser" ? "bg-gray-200" : "hover:bg-gray-100"
         )}
         onClick={() => {
-          setTool(tool === "eraser" ? null : "eraser");
-          window.alert("not implemented");
+          if (tool === "eraser") {
+            editor.stopDrawingMode();
+            setTool(null);
+            return;
+          }
+          setTool("eraser");
         }}
       >
         <span className="material-symbols-outlined text-[16px]">
@@ -838,13 +843,9 @@ const DrawingTools: FC<DrawingToolsProps> = ({
       </div>
       <div
         className={clsx(
-          "w-[24px] flex justify-center items-center rounded select-none cursor-pointer",
-          tool === "crop" ? "bg-gray-200" : "hover:bg-gray-100"
+          "w-[24px] flex justify-center items-center rounded select-none",
+          "opacity-50 cursor-not-allowed"
         )}
-        onClick={() => {
-          setTool(tool === "crop" ? null : "crop");
-          window.alert("not implemented");
-        }}
       >
         <span className="material-symbols-outlined text-[16px]">crop</span>
       </div>
@@ -946,7 +947,12 @@ const DrawingTools: FC<DrawingToolsProps> = ({
               urls: [url],
             })
           );
-          setIsDirty(false);
+          dispatch(
+            generatedImagesSlice.actions.setImageDirty({
+              id: image.id,
+              isDirty: false,
+            })
+          );
           setIsSaving(false);
         }}
       >
@@ -968,7 +974,12 @@ const DrawingTools: FC<DrawingToolsProps> = ({
           editor.loadImageFromURL(image.url[0], "imageName").then(() => {
             editor.clearUndoStack();
           });
-          setIsDirty(false);
+          dispatch(
+            generatedImagesSlice.actions.setImageDirty({
+              id: image.id,
+              isDirty: false,
+            })
+          );
         }}
       >
         <span className="material-symbols-outlined text-[16px]">delete</span>
