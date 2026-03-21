@@ -26,9 +26,27 @@ const CHILD_IMAGE_DISTANCE_Y = 440;
 
 type ImageChild =
   | { type: "upscaled"; id: string; position?: number }
-  | { type: "variations"; id: string };
+  | { type: "variations"; id: string }
+  | { type: "video"; id: string };
 
-type VariationGeneration = {
+export type VideoGeneration = {
+  type: "video";
+  id: string;
+  jobId: string;
+  videoUrl: string | null;
+  errorMessage: string | null;
+  prompt: string;
+  status: "queued" | "processing" | "completed" | "failed";
+  progress: number;
+  model: "sora-2" | "sora-2-pro";
+  duration: "4" | "8" | "12" | "16" | "20";
+  size: "1280x720" | "720x1280" | "1920x1080" | "1080x1920";
+  sourceImageUrl: string | null;
+  children: [];
+  transform: { x: number; y: number };
+};
+
+export type VariationGeneration = {
   type: "variations";
   id: string;
   url: string[] | null;
@@ -44,7 +62,7 @@ type VariationGeneration = {
     y: number;
   };
 };
-type UpscaledGeneration = {
+export type UpscaledGeneration = {
   type: "upscaled";
   id: string;
   url: [string] | null; // stay consistent cause I'm lazy but still get typesafety
@@ -61,7 +79,7 @@ type UpscaledGeneration = {
     y: number;
   };
 };
-export type GeneratedImage = VariationGeneration | UpscaledGeneration;
+export type GeneratedImage = VariationGeneration | UpscaledGeneration | VideoGeneration;
 
 type HistoryItem =
   | { type: "image-editor"; imageId: string }
@@ -931,7 +949,7 @@ export const generatedImagesSlice = createSlice({
       action: PayloadAction<{ id: string; urls: string[] }>
     ) => {
       const image = state.images[action.payload.id];
-      if (image == null) {
+      if (image == null || image.type === "video") {
         console.error("Invalid image", image);
         return;
       }
@@ -941,7 +959,9 @@ export const generatedImagesSlice = createSlice({
       state,
       action: PayloadAction<{ id: string; child: ImageChild }>
     ) => {
-      state.images[action.payload.id]!.children.push(action.payload.child);
+      const img = state.images[action.payload.id];
+      if (img == null) return;
+      (img.children as ImageChild[]).push(action.payload.child);
     },
     removeImageChild: (
       state,
@@ -959,8 +979,9 @@ export const generatedImagesSlice = createSlice({
       state,
       action: PayloadAction<{ id: string; percentage: number }>
     ) => {
-      state.images[action.payload.id]!.percentageDone =
-        action.payload.percentage;
+      const img = state.images[action.payload.id];
+      if (img == null || img.type === "video") return;
+      img.percentageDone = action.payload.percentage;
     },
     moveImage: (
       state,
@@ -1014,6 +1035,45 @@ export const generatedImagesSlice = createSlice({
       action: PayloadAction<{ historyIndex: number }>
     ) => {
       state.historyIndex = action.payload.historyIndex;
+    },
+    setVideoJobId: (
+      state,
+      action: PayloadAction<{ id: string; jobId: string }>
+    ) => {
+      const item = state.images[action.payload.id];
+      if (item?.type !== "video") return;
+      item.jobId = action.payload.jobId;
+    },
+    setVideoStatus: (
+      state,
+      action: PayloadAction<{
+        id: string;
+        status: VideoGeneration["status"];
+        progress: number;
+        errorMessage?: string | null;
+      }>
+    ) => {
+      const item = state.images[action.payload.id];
+      if (item?.type !== "video") return;
+      item.status = action.payload.status;
+      item.progress = action.payload.progress;
+      item.errorMessage =
+        action.payload.errorMessage !== undefined
+          ? action.payload.errorMessage
+          : action.payload.status === "failed"
+            ? item.errorMessage
+            : null;
+    },
+    setVideoUrl: (
+      state,
+      action: PayloadAction<{ id: string; videoUrl: string }>
+    ) => {
+      const item = state.images[action.payload.id];
+      if (item?.type !== "video") return;
+      item.videoUrl = action.payload.videoUrl;
+      item.status = "completed";
+      item.progress = 100;
+      item.errorMessage = null;
     },
   },
 });
@@ -1425,7 +1485,7 @@ export const generateImageToImageVariations = (
     const originalImage = state.generatedImages.images[imageId];
     const workspaceTransform = state.generatedImages.workspaceTransform;
     const images = state.generatedImages.images;
-    if (originalImage == null || originalImage.url == null) {
+    if (originalImage == null || originalImage.type === "video" || originalImage.url == null) {
       console.error("Could not find image", imageId);
       return;
     }
@@ -1519,7 +1579,7 @@ export const upscaleImage = (imageId: string, position: number): AppThunk => {
   return async (dispatch, getState) => {
     const state = getState().generatedImages;
     const originalImage = state.images[imageId];
-    if (originalImage == null || originalImage.url == null) {
+    if (originalImage == null || originalImage.type === "video" || originalImage.url == null) {
       console.error("Could not find image", imageId);
       return;
     }
@@ -1589,7 +1649,7 @@ export const addImageToWorkspace = (
   return (dispatch, getState) => {
     const state = getState().generatedImages;
     const originalImage = state.images[imageId];
-    if (originalImage == null || originalImage.url == null) {
+    if (originalImage == null || originalImage.type === "video" || originalImage.url == null) {
       console.error("Could not find image", imageId);
       return;
     }
@@ -1650,6 +1710,360 @@ export const onWorkspaceElement = (workspaceEl: HTMLElement): AppThunk => {
   };
 };
 
+const VIDEO_POLL_INTERVAL_MS = 5000;
+const VIDEO_POLL_ERROR_INTERVAL_MS = 8000;
+const VIDEO_POLL_MAX_ERRORS = 10;
+const VIDEO_POLL_MAX_ATTEMPTS = 360;
+
+export const pollVideoStatus = (
+  nodeId: string,
+  jobId: string,
+  _consecutiveErrors = 0,
+  _totalAttempts = 0,
+): AppThunk => {
+  return async (dispatch, getState) => {
+    const node = getState().generatedImages.images[nodeId];
+    if (!node || node.type !== "video") return;
+    if (node.status === "completed" || node.status === "failed") return;
+
+    if (_totalAttempts >= VIDEO_POLL_MAX_ATTEMPTS) {
+      console.error(`Video poll timeout after ${_totalAttempts} attempts for ${jobId}`);
+      dispatch(
+        generatedImagesSlice.actions.setVideoStatus({
+          id: nodeId,
+          status: "failed",
+          progress: 0,
+          errorMessage: "Video generation timed out. Please try a different prompt.",
+        })
+      );
+      return;
+    }
+
+    try {
+      const statusRes = await fetch(`${getApi()}/video-status/${jobId}`, {
+        cache: "no-store",
+        headers: {
+          "x-openai-token": localStorage.getItem(OPENAI_TOKEN_KEY) ?? "",
+        },
+      });
+
+      if (!statusRes.ok) {
+        let errorMessage = `Server returned ${statusRes.status}`;
+        try {
+          const errorBody = await statusRes.json();
+          if (errorBody?.error) {
+            errorMessage = String(errorBody.error);
+          }
+        } catch {
+          errorMessage = `Server returned ${statusRes.status}`;
+        }
+        throw new Error(errorMessage);
+      }
+
+      const statusData = await statusRes.json();
+
+      if (statusData.status === "completed" && statusData.videoUrl) {
+        dispatch(generatedImagesSlice.actions.setVideoUrl({
+          id: nodeId,
+          videoUrl: statusData.videoUrl,
+        }));
+        const completedNode = getState().generatedImages.images[nodeId];
+        if (completedNode) {
+          const scale = Math.max(1.1, getState().generatedImages.workspaceTransform.scale);
+          dispatch(smoothTransformWorkspace({
+            x: (-completedNode.transform.x - 200) * scale,
+            y: (-completedNode.transform.y - 112) * scale,
+            scale,
+          }));
+        }
+        return;
+      }
+
+      if (statusData.status === "failed") {
+        dispatch(
+          generatedImagesSlice.actions.setVideoStatus({
+            id: nodeId,
+            status: "failed",
+            progress: statusData.progress ?? 0,
+            errorMessage:
+              typeof statusData.error === "string" && statusData.error.trim().length > 0
+                ? statusData.error
+                : "Video generation failed.",
+          })
+        );
+        return;
+      }
+
+      dispatch(generatedImagesSlice.actions.setVideoStatus({
+        id: nodeId,
+        status: statusData.status === "processing" ? "processing" : "queued",
+        progress: statusData.progress ?? 0,
+      }));
+
+      setTimeout(
+        () => dispatch(pollVideoStatus(nodeId, jobId, 0, _totalAttempts + 1)),
+        VIDEO_POLL_INTERVAL_MS,
+      );
+    } catch (e) {
+      console.error("Video poll error", e);
+      const nextErrors = _consecutiveErrors + 1;
+      if (nextErrors >= VIDEO_POLL_MAX_ERRORS) {
+        console.error(`Video poll giving up after ${nextErrors} consecutive errors for ${jobId}`);
+        dispatch(
+          generatedImagesSlice.actions.setVideoStatus({
+            id: nodeId,
+            status: "failed",
+            progress: 0,
+            errorMessage:
+              e instanceof Error && e.message.trim().length > 0
+                ? e.message
+                : "Could not fetch video status from the server.",
+          })
+        );
+        return;
+      }
+      setTimeout(
+        () => dispatch(pollVideoStatus(nodeId, jobId, nextErrors, _totalAttempts + 1)),
+        VIDEO_POLL_ERROR_INTERVAL_MS,
+      );
+    }
+  };
+};
+
+const parseVideoParams = (prompt: string): {
+  size: VideoGeneration["size"];
+  duration: VideoGeneration["duration"];
+  model: VideoGeneration["model"];
+} => {
+  const lowerPrompt = prompt.toLowerCase();
+  
+  // Parse size from prompt
+  let size: VideoGeneration["size"] = "1280x720"; // default landscape 720p
+  if (lowerPrompt.includes("portrait") || lowerPrompt.includes("vertical") || lowerPrompt.includes("9:16")) {
+    size = "720x1280";
+  } else if (lowerPrompt.includes("1080p") || lowerPrompt.includes("hd") || lowerPrompt.includes("high res")) {
+    size = "1920x1080";
+  } else if (lowerPrompt.includes("portrait 1080p") || lowerPrompt.includes("vertical 1080p")) {
+    size = "1080x1920";
+  }
+  
+  // Parse duration from prompt
+  let duration: VideoGeneration["duration"] = "12"; // default
+  if (lowerPrompt.includes("4 seconds") || lowerPrompt.includes("4s") || lowerPrompt.includes("quick")) {
+    duration = "4";
+  } else if (lowerPrompt.includes("8 seconds") || lowerPrompt.includes("8s") || lowerPrompt.includes("short")) {
+    duration = "8";
+  } else if (lowerPrompt.includes("16 seconds") || lowerPrompt.includes("16s") || lowerPrompt.includes("long")) {
+    duration = "16";
+  } else if (lowerPrompt.includes("20 seconds") || lowerPrompt.includes("20s") || lowerPrompt.includes("extended")) {
+    duration = "20";
+  }
+  
+  // Parse model from prompt
+  let model: VideoGeneration["model"] = "sora-2-pro"; // default to pro for higher quality
+  if (lowerPrompt.includes("fast") || lowerPrompt.includes("quick") || lowerPrompt.includes("draft")) {
+    model = "sora-2"; // use faster model if explicitly requested
+  }
+  
+  return { size, duration, model };
+};
+
+export const generateVideoFromPrompt = (
+  prompt: string,
+  opts?: { navigate?: boolean }
+): AppThunk => {
+  return async (dispatch, getState) => {
+    const state = getState().generatedImages;
+    const workspaceTransform = state.workspaceTransform;
+    
+    // Parse video parameters from prompt
+    const { size, duration, model } = parseVideoParams(prompt);
+
+    const tmpId = v4();
+    const node: VideoGeneration = {
+      type: "video",
+      id: tmpId,
+      jobId: "",
+      videoUrl: null,
+      errorMessage: null,
+      prompt,
+      status: "queued",
+      progress: 0,
+      model,
+      duration,
+      size,
+      sourceImageUrl: null,
+      children: [],
+      transform: findEmptyArea(
+        -workspaceTransform.x * (1 / workspaceTransform.scale),
+        -workspaceTransform.y * (1 / workspaceTransform.scale),
+        Object.values(state.images)
+      ),
+    };
+
+    dispatch(batchActions([
+      generatedImagesSlice.actions.addImage(node),
+      generatedImagesSlice.actions.showImageInWorkspace({ id: tmpId }),
+    ]));
+
+    if (opts?.navigate) {
+      const newScale = Math.max(1.1, workspaceTransform.scale);
+      dispatch(smoothTransformWorkspace({
+        x: (-node.transform.x - 200) * newScale,
+        y: (-node.transform.y - 112) * newScale,
+        scale: newScale,
+      }));
+    }
+
+    try {
+      const response = await fetch(`${getApi()}/generate-video`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          duration,
+          model,
+          size,
+          openaiToken: localStorage.getItem(OPENAI_TOKEN_KEY),
+        }),
+      });
+      const result = await response.json();
+      if (result.error) {
+        console.error("Video generation error:", result.error);
+        dispatch(
+          generatedImagesSlice.actions.setVideoStatus({
+            id: tmpId,
+            status: "failed",
+            progress: 0,
+            errorMessage: String(result.error),
+          })
+        );
+        return;
+      }
+      dispatch(generatedImagesSlice.actions.setVideoJobId({ id: tmpId, jobId: result.jobId }));
+      dispatch(pollVideoStatus(tmpId, result.jobId));
+    } catch (e) {
+      console.error(e);
+      dispatch(
+        generatedImagesSlice.actions.setVideoStatus({
+          id: tmpId,
+          status: "failed",
+          progress: 0,
+          errorMessage:
+            e instanceof Error && e.message.trim().length > 0
+              ? e.message
+              : "Could not start video generation.",
+        })
+      );
+    }
+  };
+};
+
+export const generateVideoFromImage = (
+  sourceImageId: string,
+  sourceImageUrl: string,
+  prompt: string
+): AppThunk => {
+  return async (dispatch, getState) => {
+    const state = getState().generatedImages;
+    
+    // Parse video parameters from prompt
+    // For image-to-video, default to 1280x720 since most generated images are 1024x1024
+    // and need to be resized by the backend
+    const { duration, model } = parseVideoParams(prompt);
+    const size: VideoGeneration["size"] = "1280x720"; // Fixed size for image-to-video
+
+    const tmpId = v4();
+    const node: VideoGeneration = {
+      type: "video",
+      id: tmpId,
+      jobId: "",
+      videoUrl: null,
+      errorMessage: null,
+      prompt,
+      status: "queued",
+      progress: 0,
+      model,
+      duration,
+      size,
+      sourceImageUrl,
+      children: [],
+      transform: findEmptyArea(
+        -state.workspaceTransform.x * (1 / state.workspaceTransform.scale),
+        -state.workspaceTransform.y * (1 / state.workspaceTransform.scale),
+        Object.values(state.images)
+      ),
+    };
+
+    dispatch(batchActions([
+      generatedImagesSlice.actions.addImage(node),
+      generatedImagesSlice.actions.showImageInWorkspace({ id: tmpId }),
+      generatedImagesSlice.actions.appendImageChild({
+        id: sourceImageId,
+        child: { type: "video", id: tmpId },
+      }),
+    ]));
+
+    try {
+      const response = await fetch(`${getApi()}/generate-video`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          duration,
+          model,
+          size,
+          sourceImageUrl,
+          openaiToken: localStorage.getItem(OPENAI_TOKEN_KEY),
+        }),
+      });
+      const result = await response.json();
+      if (result.error) {
+        dispatch(
+          generatedImagesSlice.actions.setVideoStatus({
+            id: tmpId,
+            status: "failed",
+            progress: 0,
+            errorMessage: String(result.error),
+          })
+        );
+        return;
+      }
+      dispatch(generatedImagesSlice.actions.setVideoJobId({ id: tmpId, jobId: result.jobId }));
+      dispatch(pollVideoStatus(tmpId, result.jobId));
+    } catch (e) {
+      console.error(e);
+      dispatch(
+        generatedImagesSlice.actions.setVideoStatus({
+          id: tmpId,
+          status: "failed",
+          progress: 0,
+          errorMessage:
+            e instanceof Error && e.message.trim().length > 0
+              ? e.message
+              : "Could not start video generation.",
+        })
+      );
+    }
+  };
+};
+
+export const resumeVideoPolling = (): AppThunk => {
+  return (dispatch, getState) => {
+    const images = getState().generatedImages.images;
+    for (const id in images) {
+      const node = images[id];
+      if (
+        node.type === "video" &&
+        node.jobId &&
+        (node.status === "queued" || node.status === "processing")
+      ) {
+        dispatch(pollVideoStatus(id, node.jobId));
+      }
+    }
+  };
+};
+
 const persistConfigGeneratedImage = {
   key: "generatedImages",
   storage,
@@ -1678,6 +2092,17 @@ export const store = configureStore({
     return getDefaultMiddlware({
       thunk: {
         extraArgument: thunkExtra,
+      },
+      serializableCheck: {
+        ignoredActions: [
+          "persist/FLUSH",
+          "persist/REHYDRATE",
+          "persist/PAUSE",
+          "persist/PERSIST",
+          "persist/PURGE",
+          "persist/REGISTER",
+          "BATCHING_REDUCER.BATCH",
+        ],
       },
     });
   },

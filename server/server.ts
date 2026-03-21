@@ -9,6 +9,7 @@ import { dirname } from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import crypto from "crypto";
+import sharp from "sharp";
 import type { Request, Response, NextFunction } from "express";
 
 if (!globalThis.fetch) {
@@ -23,7 +24,8 @@ if (!globalThis.fetch) {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-dotenv.config();
+// Load .env from the server root directory (parent of dist)
+dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const app = express();
 app.set("trust proxy", true);
@@ -383,6 +385,121 @@ app.post("/upload", async (req, res) => {
       requestId,
       mimeType,
     });
+    res.status(500).json({ error: error.message ?? String(error) });
+  }
+});
+
+app.post("/generate-video", async (req, res) => {
+  const { prompt, duration, model, size, sourceImageUrl, openaiToken } = req.body;
+  const requestId = res.locals.requestId as string;
+
+  const openai = getOpenAIClient(openaiToken);
+  if (!openai) {
+    res.status(400).json({ error: "Missing or invalid OpenAI API key." });
+    return;
+  }
+
+  try {
+    logInfo("video.generate.start", {
+      requestId,
+      promptPreview: trimPromptForLog(prompt),
+      model: model ?? "sora-2",
+      duration: duration ?? "8",
+    });
+
+    const openaiAny = openai as any;
+    let result: any;
+
+    if (sourceImageUrl) {
+      const { buffer, contentType } = await urlToBuffer(sourceImageUrl);
+      
+      // Parse video dimensions from size parameter
+      const videoSize = size ?? "1280x720";
+      const [width, height] = videoSize.split('x').map(Number);
+      
+      // Resize image to match video dimensions
+      const resizedBuffer = await sharp(buffer)
+        .resize(width, height, {
+          fit: 'cover',
+          position: 'center'
+        })
+        .png()
+        .toBuffer();
+      
+      const imageFile = await toFile(resizedBuffer, "reference.png", { type: "image/png" });
+      result = await openaiAny.videos.create({
+        prompt,
+        model: model ?? "sora-2",
+        size: videoSize,
+        seconds: String(duration ?? "8"),
+        input_reference: imageFile,
+      });
+    } else {
+      result = await openaiAny.videos.create({
+        prompt,
+        model: model ?? "sora-2",
+        size: size ?? "1280x720",
+        seconds: String(duration ?? "8"),
+      });
+    }
+
+    const jobId = result.id ?? result.data?.[0]?.id;
+    logInfo("video.generate.queued", { requestId, jobId });
+    res.json({ jobId, status: result.status ?? "queued" });
+  } catch (error: any) {
+    logError("video.generate.error", error, { requestId });
+    res.status(500).json({ error: error.message ?? String(error) });
+  }
+});
+
+app.get("/video-status/:jobId", async (req, res) => {
+  const { jobId } = req.params;
+  const openaiToken = req.header("x-openai-token");
+  const requestId = res.locals.requestId as string;
+
+  const openai = getOpenAIClient(openaiToken);
+  if (!openai) {
+    res.status(400).json({ error: "Missing or invalid OpenAI API key." });
+    return;
+  }
+
+  res.setHeader("Cache-Control", "no-store");
+
+  try {
+    const openaiAny = openai as any;
+    const statusResult: any = await openaiAny.videos.retrieve(jobId);
+    const status: string = statusResult.status;
+    const progress: number = statusResult.progress ?? (status === "completed" ? 100 : 0);
+
+    if (status === "completed") {
+      const localFilename = `${jobId}.mp4`;
+      const localPath = path.join(UPLOADS_DIR, localFilename);
+
+      if (!fs.existsSync(localPath)) {
+        logInfo("video.download.start", { requestId, jobId });
+        const content: any = await openaiAny.videos.downloadContent(jobId);
+        const ab: ArrayBuffer = typeof content.arrayBuffer === "function"
+          ? await content.arrayBuffer()
+          : content;
+        const bytes = new Uint8Array(ab);
+        fs.writeFileSync(localPath, bytes);
+        logInfo("video.download.saved", { requestId, jobId, filename: localFilename, bytes: bytes.length });
+      }
+
+      const baseUrl = getBaseUrl(req);
+      return res.json({ status: "completed", progress: 100, videoUrl: `${baseUrl}/images/${localFilename}` });
+    }
+
+    if (status === "failed") {
+      const errorMessage = statusResult.error?.message ?? statusResult.error ?? null;
+      logInfo("video.generate.failed", { requestId, jobId, errorMessage, fullStatus: statusResult });
+      return res.json({ status: "failed", progress, error: errorMessage });
+    }
+
+    const mapped = status === "in_progress" ? "processing" : "queued";
+    res.json({ status: mapped, progress });
+  } catch (error: any) {
+    logError("video.status.error", error, { requestId, jobId });
     res.status(500).json({ error: error.message ?? String(error) });
   }
 });

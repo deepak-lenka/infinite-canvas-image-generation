@@ -10,6 +10,7 @@ import {
 } from "react";
 import {
   GeneratedImage,
+  VideoGeneration,
   generatedImagesSlice,
   localWorkspaceTransform,
   navigateHistory,
@@ -266,12 +267,6 @@ export const Content: FC = () => {
       >
         {/*  EHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH */}
         {useMemo(() => {
-          // const imgs: ReactNode[] = [];
-          // for (const id in images) {
-          //   if (!(id in workspaceImages)) {
-          //     imgs.push(<GeneratedImageItem key={id} image={images[id]} />);
-          //   }
-          // }
           return Object.values(images).map((image) => (
             <GeneratedImageItem key={image.id} image={image} />
           ));
@@ -304,7 +299,7 @@ const GeneratedImageItem: FC<GeneratedImageItemProps> = ({ image }) => {
   const [dragging, setDragging] = useState(false);
 
   const isEditing = editorId === image.id;
-  const isOtherImageEditing = !isEditing && editorId != null;
+  const isOtherImageEditing = !isEditing && editorId != null && image.type !== "video";
   const style = useSpring(
     useMemo(
       () => ({
@@ -353,8 +348,9 @@ const GeneratedImageItem: FC<GeneratedImageItemProps> = ({ image }) => {
         id: image.id,
       })
     );
+    const isReady = image.type === "video" ? image.videoUrl != null : image.url != null;
     if (
-      image.url == null ||
+      !isReady ||
       isEditing ||
       dragging ||
       workspaceTool !== "select-tool"
@@ -365,15 +361,10 @@ const GeneratedImageItem: FC<GeneratedImageItemProps> = ({ image }) => {
   };
 
   const cursor = (() => {
-    if (workspaceTool === "delete-tool") {
-      return "cursor-not-allowed";
-    }
-    if (dragging) {
-      return "cursor-grabbing";
-    }
-    if (workspaceTool === "grab-tool" || image.url == null) {
-      return "cursor-grab";
-    }
+    if (workspaceTool === "delete-tool") return "cursor-not-allowed";
+    if (dragging) return "cursor-grabbing";
+    const isLoading = image.type === "video" ? image.videoUrl == null : image.url == null;
+    if (workspaceTool === "grab-tool" || isLoading) return "cursor-grab";
     return "cursor-pointer";
   })();
 
@@ -399,17 +390,58 @@ const GeneratedImageItem: FC<GeneratedImageItemProps> = ({ image }) => {
       onMouseUp={onClick}
       onMouseDown={onMouseDown}
     >
-      {image.url != null ? (
+      {image.type === "video" ? (
+        <VideoItem video={image} />
+      ) : image.url != null ? (
         <Image imageRef={imageRef} image={image} isEditing={isEditing} />
       ) : (
-        <div className="w-[300px] h-[300px] bg-gray-100 flex justify-center items-center flex-col gap-y-4">
+        <div className="w-[300px] h-[300px] bg-gray-100 flex justify-center items-center flex-col gap-y-4 p-4">
           <LoadingBar progress={100} slow={image.percentageDone === 0} />
-          <div className="text-gray-600 text-[12px] break-words px-4 flex-1 justify-center grow-0 max-w-full">
+          <div className="text-gray-600 text-[12px] px-2 text-center max-w-full break-words overflow-y-auto flex-1">
             {image.prompt}
           </div>
         </div>
       )}
     </animated.div>
+  );
+};
+
+const VideoItem: FC<{ video: VideoGeneration }> = ({ video }) => {
+  if (video.videoUrl != null) {
+    return (
+      <video
+        key={video.videoUrl}
+        src={video.videoUrl}
+        className="w-[400px] h-[225px] object-cover rounded flex-shrink-0"
+        autoPlay
+        loop
+        muted
+        playsInline
+      />
+    );
+  }
+  return (
+    <div className="w-[400px] h-[225px] bg-gray-100 flex flex-col justify-center items-center gap-y-2 rounded flex-shrink-0 p-3">
+      <LoadingBar
+        progress={video.status === "processing" ? video.progress : 100}
+        slow={video.status === "queued"}
+      />
+      <div className="text-gray-500 text-[11px]">
+        {video.status === "queued"
+          ? "Queued..."
+          : video.status === "failed"
+          ? "Generation failed"
+          : `Generating video ${video.progress}%`}
+      </div>
+      {video.status === "failed" && video.errorMessage != null && (
+        <div className="text-red-400 text-[10px] break-words px-2 text-center max-w-full">
+          {video.errorMessage}
+        </div>
+      )}
+      <div className="text-gray-400 text-[9px] px-2 text-center max-w-full break-words overflow-y-auto flex-1">
+        {video.prompt}
+      </div>
+    </div>
   );
 };
 

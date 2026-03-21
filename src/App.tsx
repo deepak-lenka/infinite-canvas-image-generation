@@ -3,6 +3,7 @@ import { FC, KeyboardEventHandler, useEffect, useRef, useState } from "react";
 import {
   addWhiteImage,
   generateImageVariations,
+  generateVideoFromPrompt,
   generatedImagesSlice,
   importImageFromFile,
   useAppDispatch,
@@ -103,8 +104,14 @@ function App() {
     transRef.start();
   }, [show, transRef]);
 
+  const [genMode, setGenMode] = useState<"image" | "video">("image");
+
   const onGenerate = (prompt: string) => {
-    dispatch(generateImageVariations(prompt, { navigate: true }));
+    if (genMode === "video") {
+      dispatch(generateVideoFromPrompt(prompt, { navigate: true }));
+    } else {
+      dispatch(generateImageVariations(prompt, { navigate: true }));
+    }
   };
   const onImportImage = async (file: File | null) => {
     if (file == null) {
@@ -143,11 +150,32 @@ function App() {
         (style, item) =>
           item && (
             <animated.div style={style} className="absolute bottom-6 left-1/2">
-              <div className="-translate-x-1/2">
+              <div className="-translate-x-1/2 flex flex-col items-center gap-2">
+                {/* Mode toggle */}
+                <div className="flex gap-1 canvas-item bg-white rounded-lg p-1 text-[12px] select-none">
+                  <button
+                    className={clsx(
+                      "px-3 py-1 rounded-md transition-colors",
+                      genMode === "image" ? "bg-gray-200 font-medium" : "hover:bg-gray-100"
+                    )}
+                    onClick={() => setGenMode("image")}
+                  >
+                    Image
+                  </button>
+                  <button
+                    className={clsx(
+                      "px-3 py-1 rounded-md transition-colors",
+                      genMode === "video" ? "bg-purple-100 font-medium text-purple-700" : "hover:bg-gray-100"
+                    )}
+                    onClick={() => setGenMode("video")}
+                  >
+                    ✦ Sora Video
+                  </button>
+                </div>
                 <ImagineInput
                   id="imagine-input"
-                  buttonText={"Generate"}
-                  placeholder={"Imagine..."}
+                  buttonText="Generate"
+                  placeholder={genMode === "video" ? "Describe your video..." : "Imagine..."}
                   onSubmit={onGenerate}
                 />
               </div>

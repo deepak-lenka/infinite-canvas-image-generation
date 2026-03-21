@@ -2,7 +2,8 @@ import { useSpringRef, animated, useSpring } from "@react-spring/web";
 import { RefObject, FC, useState, useEffect, useRef, useMemo } from "react";
 import { EclipseHalf } from "react-svg-spinners";
 import {
-  GeneratedImage,
+  VariationGeneration,
+  UpscaledGeneration,
   useAppDispatch,
   useAppSelector,
   setEditingImage,
@@ -11,9 +12,12 @@ import {
   uploadImage,
   generatedImagesSlice,
   generateImageToImageVariations,
+  generateVideoFromImage,
   addImageToWorkspace,
   selectIsImageDirty,
 } from "./state";
+
+type NonVideoImage = VariationGeneration | UpscaledGeneration;
 import { assertNever } from "./utils/assertNever";
 import { useTransition } from "@react-spring/web";
 import ImageEditor from "tui-image-editor";
@@ -28,7 +32,7 @@ import { PenWidthPicker } from "./PenWidthPicker";
 import { toOptimizedImage } from "./utils/toOptimizedImage";
 
 interface ImageEditorProps {
-  image: GeneratedImage;
+  image: NonVideoImage;
   isEditing: boolean;
   imageRef: RefObject<HTMLImageElement>;
 }
@@ -36,10 +40,11 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
   const dispatch = useAppDispatch();
   const inTransRef = useSpringRef();
   const generateVariationsTransRef = useSpringRef();
+  const generateVideoTransRef = useSpringRef();
   const drawTransRef = useSpringRef();
 
   const [editor, setEditor] = useState<ImageEditor | null>(null);
-  const [tool, setTool] = useState<"generate-variations" | "draw" | null>(null);
+  const [tool, setTool] = useState<"generate-variations" | "generate-video" | "draw" | null>(null);
   const editorRef = useRef<HTMLDivElement | null>(null);
   const imageChildren = useAppSelector((state) =>
     selectUpscaledImageChildren(state, image.id)
@@ -97,6 +102,23 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
   useEffect(() => {
     generateVariationsTransRef.start();
   }, [isGeneratingVariations, generateVariationsTransRef]);
+
+  const isGeneratingVideo = tool == "generate-video";
+  const transitionGenerateVideo = useTransition(
+    isGeneratingVideo,
+    useMemo(
+      () => ({
+        ref: generateVideoTransRef,
+        from: { opacity: 0, transform: "translateY(-50px)" },
+        enter: { opacity: 1, transform: "translateY(0px)" },
+        leave: { opacity: 0, transform: "translateY(-50px)" },
+      }),
+      [generateVideoTransRef]
+    )
+  );
+  useEffect(() => {
+    generateVideoTransRef.start();
+  }, [isGeneratingVideo, generateVideoTransRef]);
 
   const isDrawing = tool == "draw";
   const transitionDraw = useTransition(
@@ -180,9 +202,11 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
     if (activePosition == null) {
       return "none";
     }
+    const activeChild = imageChildren[activePosition];
     if (
       activePosition in imageChildren &&
-      imageChildren[activePosition].percentageDone === 100
+      activeChild.type !== "video" &&
+      activeChild.percentageDone === 100
     ) {
       return "jump-to-image";
     }
@@ -224,6 +248,27 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
                     Use black strokes on a white canvas for best sketch generations.
                   </div>
                 )}
+              </div>
+            </animated.div>
+          )
+      )}
+      {transitionGenerateVideo(
+        (style, item) =>
+          item && (
+            <animated.div style={style} className="absolute -bottom-1">
+              <div className="translate-y-full scale-[0.625]">
+                <ImagineInput
+                  id="video-input"
+                  initialText={image.prompt}
+                  buttonText="Generate"
+                  placeholder="Describe your video..."
+                  onSubmit={(prompt) => {
+                    if (image.type === "upscaled" && image.url != null) {
+                      dispatch(generateVideoFromImage(image.id, image.url[0], prompt));
+                      setTool(null);
+                    }
+                  }}
+                />
               </div>
             </animated.div>
           )
@@ -349,7 +394,7 @@ export const Image: FC<ImageEditorProps> = ({ imageRef, image, isEditing }) => {
 };
 
 interface GenerationShowcaseProps {
-  image: GeneratedImage;
+  image: NonVideoImage;
 }
 const GenerationShowcase: FC<GenerationShowcaseProps> = ({ image }) => {
   const dispatch = useAppDispatch();
@@ -490,6 +535,22 @@ const GenerationShowcase: FC<GenerationShowcaseProps> = ({ image }) => {
                   )} */}
 
                   {(() => {
+                    if (imageChild.type === "video") {
+                      return imageChild.videoUrl != null ? (
+                        <video
+                          src={imageChild.videoUrl}
+                          className="w-full rounded"
+                          autoPlay
+                          loop
+                          muted
+                          playsInline
+                        />
+                      ) : (
+                        <div className="bg-gray-100 min-h-[80px] rounded flex justify-center items-center text-[8px] text-gray-500">
+                          Video generating...
+                        </div>
+                      );
+                    }
                     if (imageChild.url == null) {
                       return (
                         <LoadingBar
@@ -523,11 +584,11 @@ const GenerationShowcase: FC<GenerationShowcaseProps> = ({ image }) => {
 interface EditorProps {
   position: number | null;
   imageState: "jump-to-image" | "upscale-image" | "loading-image" | "none";
-  image: GeneratedImage;
+  image: NonVideoImage;
   editor: ImageEditor | null;
   isDirty: boolean;
-  tool: "generate-variations" | "draw" | null;
-  setTool: (tool: "generate-variations" | "draw" | null) => void;
+  tool: "generate-variations" | "generate-video" | "draw" | null;
+  setTool: (tool: "generate-variations" | "generate-video" | "draw" | null) => void;
 }
 const Editor: FC<EditorProps> = ({
   imageState,
@@ -584,6 +645,29 @@ const Editor: FC<EditorProps> = ({
               </span>
             </div>
             Generate variations
+          </button>
+        )}
+        {image.type === "upscaled" && image.url != null && (
+          <button
+            className="px-2 py-2 flex items-center hover:bg-[#f6f6f6] active:bg-[#f2f2f2]"
+            onClick={() => {
+              if (isDirty) {
+                window.alert("Save or discard paint changes first!");
+                return;
+              }
+              setTool(
+                tool === "generate-video" ? null : "generate-video"
+              );
+              setTimeout(
+                () => document.getElementById("video-input")?.focus(),
+                100
+              );
+            }}
+          >
+            <div className="flex items-center w-5">
+              <span className="material-symbols-outlined text-[12px]">movie</span>
+            </div>
+            Generate video
           </button>
         )}
         {image.type === "upscaled" && (
@@ -741,7 +825,7 @@ const Editor: FC<EditorProps> = ({
 interface DrawingToolsProps {
   editor: ImageEditor;
   isDirty: boolean;
-  image: GeneratedImage;
+  image: NonVideoImage;
 }
 const DrawingTools: FC<DrawingToolsProps> = ({ editor, image, isDirty }) => {
   const dispatch = useAppDispatch();
